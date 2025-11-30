@@ -1,8 +1,9 @@
+--!nonstrict
+
 local WorkflowOrchestratorService = {}
 WorkflowOrchestratorService.__index = WorkflowOrchestratorService
 
 export type Context = { [any]: any }
-
 export type WorkflowStep = {
 	id: string,
 	action: (Context) -> any,
@@ -12,25 +13,33 @@ export type WorkflowStep = {
 	retries: number?
 }
 
-local function DeepCopy(orig: any): any
+local function DeepCopy(orig: any, visited: { [any]: any }?): any
 	local orig_type = type(orig)
 	local copy
+	
 	if orig_type == 'table' then
-		copy = {}
-		for orig_key, orig_value in pairs(orig) do
-			copy[DeepCopy(orig_key)] = DeepCopy(orig_value)
+		visited = visited or {}
+		
+		if visited[orig] then
+			return visited[orig]
 		end
-
+		
+		copy = {}
+		visited[orig] = copy
+		
+		for orig_key, orig_value in pairs(orig) do
+			copy[DeepCopy(orig_key, visited)] = DeepCopy(orig_value, visited)
+		end
+		
 		local mt = getmetatable(orig)
 		if mt then
-			setmetatable(copy, DeepCopy(mt))
+			setmetatable(copy, DeepCopy(mt, visited))
 		end
 	else 
 		copy = orig
 	end
 	return copy
 end
-
 
 local Logger = {}
 Logger.__index = Logger
@@ -51,7 +60,6 @@ function Logger:Error(msg, data)
 	warn(string.format("[ERROR] %s | Data: %s", msg, data and game:GetService("HttpService"):JSONEncode(data) or "nil"))
 end
 
-
 local Signal = {}
 Signal.__index = Signal
 
@@ -70,7 +78,6 @@ end
 function Signal:Destroy()
 	self._bindable:Destroy()
 end
-
 
 local Promise = {}
 Promise.__index = Promise
@@ -127,7 +134,7 @@ end
 function Promise.delay(seconds)
 	return Promise.new(function(resolve)
 		task.wait(seconds)
-		resolve(nil) 
+		resolve(nil)
 	end)
 end
 
@@ -152,19 +159,11 @@ function Promise:andThen(onFulfilled, onRejected)
 		end
 
 		local function successHandler(val)
-			if onFulfilled then
-				handle(onFulfilled, val)
-			else
-				resolve(val)
-			end
+			if onFulfilled then handle(onFulfilled, val) else resolve(val) end
 		end
 
 		local function errorHandler(err)
-			if onRejected then
-				handle(onRejected, err)
-			else
-				reject(err)
-			end
+			if onRejected then handle(onRejected, err) else reject(err) end
 		end
 
 		if self._status == PROMISE_Status.Resolved then
@@ -187,15 +186,9 @@ function Promise.race(promises)
 		for _, p in ipairs(promises) do
 			local promiseObj = p :: any 
 			promiseObj:andThen(function(val)
-				if not finished then
-					finished = true
-					resolve(val)
-				end
+				if not finished then finished = true; resolve(val) end
 			end, function(err)
-				if not finished then
-					finished = true
-					reject(err)
-				end
+				if not finished then finished = true; reject(err) end
 			end)
 		end
 	end)
@@ -204,17 +197,26 @@ end
 function WorkflowOrchestratorService.new()
 	local self = setmetatable({}, WorkflowOrchestratorService)
 	self._logger = Logger.new()
-	self._dispatcher = Signal.new()
-
-	self._steps = {} :: {WorkflowStep} 
-
+	
+	self.StepStarted = Signal.new()
+	self.StepCompleted = Signal.new()
+	self.StepFailed = Signal.new()
+	self.WorkflowStarted = Signal.new()
+	self.WorkflowPaused = Signal.new()
+	self.WorkflowResumed = Signal.new()
+	self.WorkflowCompleted = Signal.new()
+	self.WorkflowFailed = Signal.new()
+	
+	self._steps = {} :: {WorkflowStep}
 	self._context = {}
 	self._currentIndex = 0
 	self._paused = false
 	self._isRunning = false
 	self._rollbacks = {}
-	self._onComplete = nil
-	self._onError = nil
+	
+	self._mainResolve = nil
+	self._mainReject = nil
+	
 	return self
 end
 
@@ -231,86 +233,13 @@ function WorkflowOrchestratorService:AddStep(step: WorkflowStep)
 	self._logger:Info("Added workflow step", { StepId = step.id })
 end
 
-function WorkflowOrchestratorService:InsertStepAt(index: number, step: WorkflowStep)
-	assert(type(step) == "table" and type(step.id) == "string" and type(step.action) == "function", "Invalid step")
-	assert(index >= 1 and index <= #self._steps + 1, "Index out of bounds")
-
-	for _, existing in ipairs(self._steps) do
-		assert(existing.id ~= step.id, "Step ID already exists: " .. step.id)
-	end
-
-	table.insert(self._steps, index, step)
-	self._logger:Info("Inserted step", { StepId = step.id, Index = index })
-end
-
-function WorkflowOrchestratorService:RemoveStepById(stepId: string)
-	for i, step in ipairs(self._steps) do
-		if step.id == stepId then
-			table.remove(self._steps, i)
-			self._logger:Info("Removed step", { StepId = stepId })
-			return true
-		end
-	end
-	self._logger:Warn("Step not found to remove", { StepId = stepId })
-	return false
-end
-
-function WorkflowOrchestratorService:GetCurrentStep()
-	return self._steps[self._currentIndex]
-end
-
-function WorkflowOrchestratorService:IsRunning()
-	return self._isRunning
-end
-
-function WorkflowOrchestratorService:IsPaused()
-	return self._paused
-end
-
-function WorkflowOrchestratorService:SkipStep(stepId: string)
-	for _, step in ipairs(self._steps) do
-		if step.id == stepId then
-			step.condition = function() return false end
-			self._logger:Info("Step marked to be skipped", { StepId = stepId })
-			return true
-		end
-	end
-	self._logger:Warn("Step not found to skip", { StepId = stepId })
-	return false
-end
-
-function WorkflowOrchestratorService:JumpToStep(stepId: string)
-	for i, step in ipairs(self._steps) do
-		if step.id == stepId then
-			self._currentIndex = i
-			self._logger:Info("Jumped to step", { StepId = stepId })
-			return true
-		end
-	end
-	self._logger:Warn("Step not found to jump to", { StepId = stepId })
-	return false
-end
-
 function WorkflowOrchestratorService:GetSteps()
 	return DeepCopy(self._steps)
 end
 
-function WorkflowOrchestratorService:GetContext()
-	return self._context
-end
-
-function WorkflowOrchestratorService:OnComplete(callback)
-	assert(type(callback) == "function", "Callback must be a function")
-	self._onComplete = callback
-end
-
-function WorkflowOrchestratorService:OnError(callback)
-	assert(type(callback) == "function", "Callback must be a function")
-	self._onError = callback
-end
-
 function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
 	self._logger:Info("Running step", { StepId = step.id })
+	self.StepStarted:Fire(step.id, self._context)
 
 	if step.condition and not step.condition(self._context) then
 		self._logger:Info("Skipping step due to condition", { StepId = step.id })
@@ -319,7 +248,7 @@ function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
 
 	local function tryAction(attempt)
 		local promise = step.action(self._context)
-
+		
 		if not (promise and type(promise) == "table" and promise.andThen) then
 			promise = Promise.resolve(promise)
 		else
@@ -347,6 +276,8 @@ function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
 	return tryAction(0)
 		:andThen(function(result)
 			self._logger:Info("Step succeeded", { StepId = step.id })
+			self.StepCompleted:Fire(step.id, result, self._context)
+			
 			if step.rollback then
 				table.insert(self._rollbacks, function()
 					self._logger:Info("Running rollback for step", { StepId = step.id })
@@ -361,14 +292,54 @@ function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
 			return result
 		end)
 		:catch(function(err)
+			self.StepFailed:Fire(step.id, err)
 			self._logger:Error("Step failed", { StepId = step.id, Error = err })
 			return Promise.reject(err)
 		end)
 end
 
+function WorkflowOrchestratorService:_processQueue()
+	if self._paused then
+		self._logger:Info("Workflow paused at step " .. tostring(self._currentIndex))
+		self.WorkflowPaused:Fire(self._currentIndex)
+		return
+	end
+
+	if self._currentIndex > #self._steps then
+		self._logger:Info("Workflow completed successfully")
+		self._isRunning = false
+		self.WorkflowCompleted:Fire(self._context)
+		
+		if self._mainResolve then
+			self._mainResolve(self._context)
+		end
+		return
+	end
+
+	local step = self._steps[self._currentIndex]
+
+	self:_runStep(step)
+		:andThen(function()
+			if not self._isRunning then return end
+			self._currentIndex = self._currentIndex + 1
+			self:_processQueue()
+		end)
+		:catch(function(err)
+			self._logger:Warn("Workflow error, initiating rollback", { Error = err })
+			self._isRunning = false
+			self.WorkflowFailed:Fire(err, self._context)
+			
+			self:_rollback():andThen(function()
+				if self._mainReject then
+					self._mainReject(err)
+				end
+			end)
+		end)
+end
 
 function WorkflowOrchestratorService:Run(context)
 	assert(not self._isRunning, "Workflow already running")
+	
 	self._isRunning = true
 	self._paused = false
 	self._context = context or {}
@@ -376,49 +347,21 @@ function WorkflowOrchestratorService:Run(context)
 	self._rollbacks = {}
 
 	self._logger:Info("Workflow started")
+	self.WorkflowStarted:Fire(self._context)
 
-	local function runNext()
-		if self._paused then
-			self._logger:Info("Workflow paused at step " .. tostring(self._currentIndex))
-			return Promise.reject("Workflow paused")
-		end
-
-		if self._currentIndex > #self._steps then
-			self._logger:Info("Workflow completed successfully")
-			self._isRunning = false
-			if self._onComplete then pcall(function() self._onComplete(self._context) end) end
-			return Promise.resolve(self._context)
-		end
-
-		local step = self._steps[self._currentIndex]
-
-		return self:_runStep(step)
-			:andThen(function()
-				self._currentIndex = self._currentIndex + 1
-				return runNext()
-			end)
-			:catch(function(err)
-				self._logger:Warn("Workflow error, initiating rollback", { Error = err })
-				self._isRunning = false
-				if self._onError then pcall(function() self._onError(err, self._context) end) end
-
-				return self:_rollback()
-				:andThen(function()
-					return Promise.reject(err)
-				end)
-			end)
-	end
-
-	return runNext()
+	return Promise.new(function(resolve, reject)
+		self._mainResolve = resolve
+		self._mainReject = reject
+		
+		self:_processQueue()
+	end)
 end
 
 function WorkflowOrchestratorService:Pause()
-	if not self._isRunning then
-		self._logger:Warn("Cannot pause; workflow not running")
-		return false
-	end
+	if not self._isRunning then return false end
+	if self._paused then return false end
+	
 	self._paused = true
-	self._logger:Info("Workflow paused")
 	return true
 end
 
@@ -427,19 +370,27 @@ function WorkflowOrchestratorService:Resume()
 		self._logger:Warn("Cannot resume; workflow not paused")
 		return false
 	end
+	
 	self._paused = false
-	self._logger:Info("Workflow resumed")
-	return self:Run(self._context)
+	self._logger:Info("Workflow resumed from step " .. tostring(self._currentIndex))
+	self.WorkflowResumed:Fire(self._currentIndex)
+	
+	self:_processQueue()
+	
+	return true
 end
 
 function WorkflowOrchestratorService:Abort(reason)
 	if not self._isRunning then return end
+	
 	self._logger:Warn("Workflow aborted", { Reason = reason or "No reason" })
 	self._paused = true
 	self._isRunning = false
-	if self._onError then pcall(function() self._onError(reason or "Aborted", self._context) end) end
+	
+	if self._mainReject then
+		self._mainReject(reason or "Aborted")
+	end
 end
-
 
 function WorkflowOrchestratorService:_rollback()
 	self._logger:Info("Starting rollback of executed steps")
@@ -475,7 +426,14 @@ function WorkflowOrchestratorService:Reset()
 end
 
 function WorkflowOrchestratorService:Destroy()
-	self._dispatcher:Destroy()
+	self.StepStarted:Destroy()
+	self.StepCompleted:Destroy()
+	self.StepFailed:Destroy()
+	self.WorkflowStarted:Destroy()
+	self.WorkflowPaused:Destroy()
+	self.WorkflowResumed:Destroy()
+	self.WorkflowCompleted:Destroy()
+	self.WorkflowFailed:Destroy()
 	self._logger:Info("WorkflowOrchestratorService destroyed")
 end
 
