@@ -10,7 +10,31 @@ export type WorkflowStep = {
 	rollback: ((Context) -> ())?,
 	condition: ((Context) -> boolean)?,
 	timeout: number?,
-	retries: number?
+	retries: number?,
+	parallelGroups: { {WorkflowStep} }?, 
+	raceGroups: { {WorkflowStep} }?,
+	isJoinStep: boolean?,
+	branches: { {condition: (Context) -> boolean, nextStepId: string} }?,
+	loopCondition: ((Context) -> boolean)?,
+	forEachArray: ((Context) -> {any})?,
+	forEachSubWorkflow: {WorkflowStep}?,
+	maxLoopIterations: number?
+}
+export type WorkflowCheckpoint = {
+	workflowId: string,
+	version: string,
+	currentIndex: number,
+	context: Context,
+	rollbacks: {any},
+	timestamp: number
+}
+export type ScheduledWorkflow = {
+	id: string,
+	workflowId: string,
+	scheduleTime: number?,
+	interval: number?,
+	enabled: boolean,
+	lastRun: number?
 }
 
 local function DeepCopy(orig: any, visited: { [any]: any }?): any
@@ -194,6 +218,37 @@ function Promise.race(promises)
 	end)
 end
 
+function Promise.all(promises)
+	return Promise.new(function(resolve, reject)
+		if #promises == 0 then
+			resolve({})
+			return
+		end
+		
+		local results = {}
+		local completed = 0
+		local hasError = false
+		
+		for i, p in ipairs(promises) do
+			local promiseObj = p :: any
+			promiseObj:andThen(function(val)
+				if not hasError then
+					results[i] = val
+					completed = completed + 1
+					if completed == #promises then
+						resolve(results)
+					end
+				end
+			end, function(err)
+				if not hasError then
+					hasError = true
+					reject(err)
+				end
+			end)
+		end
+	end)
+end
+
 function WorkflowOrchestratorService.new()
 	local self = setmetatable({}, WorkflowOrchestratorService)
 	self._logger = Logger.new()
@@ -213,6 +268,16 @@ function WorkflowOrchestratorService.new()
 	self._paused = false
 	self._isRunning = false
 	self._rollbacks = {}
+	self._activeBranches = {}
+	self._joinStepWaiting = false
+	self._workflowId = ""
+	self._version = "1.0"
+	self._workflowTimeout = nil
+	self._workflowTimeoutPromise = nil
+	self._checkpointStorage = {}
+	self._stepIdToIndex = {}
+	self._versions = {}
+	self._loopIterations = {}
 	
 	self._mainResolve = nil
 	self._mainReject = nil
@@ -223,18 +288,103 @@ end
 function WorkflowOrchestratorService:AddStep(step: WorkflowStep)
 	assert(type(step) == "table", "Step must be a table")
 	assert(type(step.id) == "string", "Step must have string id")
-	assert(type(step.action) == "function", "Step must have action function")
+	
+	local hasAction = type(step.action) == "function"
+	local hasParallelGroups = step.parallelGroups ~= nil
+	local hasRaceGroups = step.raceGroups ~= nil
+	local isJoin = step.isJoinStep == true
+	local hasBranches = step.branches ~= nil
+	local hasLoop = step.loopCondition ~= nil
+	local hasForEach = step.forEachArray ~= nil
+	
+	assert(hasAction or hasParallelGroups or hasRaceGroups or isJoin or hasBranches or hasLoop or hasForEach, 
+		"Step must have action function, parallelGroups, raceGroups, branches, loopCondition, forEachArray, or be a join step")
+	
+	if hasParallelGroups then
+		assert(type(step.parallelGroups) == "table", "parallelGroups must be a table")
+		for i, group in ipairs(step.parallelGroups) do
+			assert(type(group) == "table", "Parallel group " .. tostring(i) .. " must be a table")
+			for j, subStep in ipairs(group) do
+				assert(type(subStep) == "table" and type(subStep.id) == "string", 
+					"Parallel group " .. tostring(i) .. " step " .. tostring(j) .. " must be a valid WorkflowStep")
+			end
+		end
+	end
+	
+	if hasRaceGroups then
+		assert(type(step.raceGroups) == "table", "raceGroups must be a table")
+		for i, group in ipairs(step.raceGroups) do
+			assert(type(group) == "table", "Race group " .. tostring(i) .. " must be a table")
+			for j, subStep in ipairs(group) do
+				assert(type(subStep) == "table" and type(subStep.id) == "string", 
+					"Race group " .. tostring(i) .. " step " .. tostring(j) .. " must be a valid WorkflowStep")
+			end
+		end
+	end
 
 	for _, existing in ipairs(self._steps) do
 		assert(existing.id ~= step.id, "Step ID already exists: " .. step.id)
 	end
 
 	table.insert(self._steps, step)
-	self._logger:Info("Added workflow step", { StepId = step.id })
+	self._logger:Info("Added workflow step", { StepId = step.id, Type = hasParallelGroups and "ParallelGroup" or hasRaceGroups and "RaceGroup" or isJoin and "JoinStep" or "Regular" })
+end
+
+function WorkflowOrchestratorService:AddParallelGroup(id: string, stepChains: { {WorkflowStep} }, options: {condition: ((Context) -> boolean)?, timeout: number?}?)
+	options = options or {}
+	local step: WorkflowStep = {
+		id = id,
+		action = function() return Promise.resolve(nil) end,
+		parallelGroups = stepChains,
+		condition = options.condition,
+		timeout = options.timeout
+	}
+	self:AddStep(step)
+	return self
+end
+
+function WorkflowOrchestratorService:AddRaceGroup(id: string, stepChains: { {WorkflowStep} }, options: {condition: ((Context) -> boolean)?, timeout: number?}?)
+	options = options or {}
+	local step: WorkflowStep = {
+		id = id,
+		action = function() return Promise.resolve(nil) end, 
+		raceGroups = stepChains,
+		condition = options.condition,
+		timeout = options.timeout
+	}
+	self:AddStep(step)
+	return self
+end
+
+function WorkflowOrchestratorService:AddJoinStep(id: string, action: ((Context) -> any)?, options: {condition: ((Context) -> boolean)?, rollback: ((Context) -> ())?}?)
+	options = options or {}
+	local step: WorkflowStep = {
+		id = id,
+		action = action or function() return Promise.resolve(nil) end,
+		isJoinStep = true,
+		condition = options.condition,
+		rollback = options.rollback
+	}
+	self:AddStep(step)
+	return self
 end
 
 function WorkflowOrchestratorService:GetSteps()
 	return DeepCopy(self._steps)
+end
+
+function WorkflowOrchestratorService:_runStepChain(stepChain: {WorkflowStep}, chainId: string, startIndex: number)
+	startIndex = startIndex or 1
+	
+	if startIndex > #stepChain then
+		return Promise.resolve(nil)
+	end
+	
+	local step = stepChain[startIndex]
+	return self:_runStep(step)
+		:andThen(function()
+			return self:_runStepChain(stepChain, chainId, startIndex + 1)
+		end)
 end
 
 function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
@@ -244,6 +394,148 @@ function WorkflowOrchestratorService:_runStep(step: WorkflowStep)
 	if step.condition and not step.condition(self._context) then
 		self._logger:Info("Skipping step due to condition", { StepId = step.id })
 		return Promise.resolve(nil)
+	end
+
+	if step.parallelGroups then
+		self._logger:Info("Executing parallel group", { StepId = step.id, BranchCount = #step.parallelGroups })
+		local branchPromises = {}
+		local branchRollbacks = {}
+		
+		for i, stepChain in ipairs(step.parallelGroups) do
+			local branchId = step.id .. "_branch_" .. tostring(i)
+			local branchRollbackList = {}
+			
+			local rollbackStartIndex = #self._rollbacks + 1
+			
+			local branchPromise = self:_runStepChain(stepChain, branchId, 1)
+				:andThen(function(result)
+					for j = rollbackStartIndex, #self._rollbacks do
+						table.insert(branchRollbackList, self._rollbacks[j])
+					end
+					return result
+				end)
+			
+			table.insert(branchPromises, branchPromise)
+			table.insert(branchRollbacks, branchRollbackList)
+		end
+		
+		local allPromise = Promise.all(branchPromises)
+		
+		if step.timeout then
+			allPromise = Promise.race({
+				allPromise,
+				Promise.delay(step.timeout):andThen(function()
+					return Promise.reject("Parallel group '" .. step.id .. "' timed out after " .. tostring(step.timeout) .. " seconds")
+				end)
+			})
+		end
+		
+		return allPromise
+			:andThen(function(results)
+				self._logger:Info("Parallel group completed", { StepId = step.id })
+				self.StepCompleted:Fire(step.id, results, self._context)
+				return results
+			end)
+			:catch(function(err)
+				self.StepFailed:Fire(step.id, err)
+				self._logger:Error("Parallel group failed", { StepId = step.id, Error = err })
+				return Promise.reject(err)
+			end)
+	end
+	
+	if step.raceGroups then
+		self._logger:Info("Executing race group", { StepId = step.id, BranchCount = #step.raceGroups })
+		local branchPromises = {}
+		local cancelledBranches = {}
+		
+		for i, stepChain in ipairs(step.raceGroups) do
+			local branchId = step.id .. "_race_branch_" .. tostring(i)
+			local branchCancelled = false
+			cancelledBranches[i] = false
+			
+			local branchPromise = Promise.new(function(resolve, reject)
+				self:_runStepChain(stepChain, branchId, 1)
+					:andThen(function(result)
+						if not cancelledBranches[i] then
+							for j = 1, #step.raceGroups do
+								if j ~= i then
+									cancelledBranches[j] = true
+								end
+							end
+							resolve({ branchIndex = i, result = result })
+						end
+					end)
+					:catch(function(err)
+						if not cancelledBranches[i] then
+							reject(err)
+						end
+					end)
+			end)
+			
+			table.insert(branchPromises, branchPromise)
+		end
+		
+		local racePromise = Promise.race(branchPromises)
+		
+		if step.timeout then
+			racePromise = Promise.race({
+				racePromise,
+				Promise.delay(step.timeout):andThen(function()
+					return Promise.reject("Race group '" .. step.id .. "' timed out after " .. tostring(step.timeout) .. " seconds")
+				end)
+			})
+		end
+		
+		return racePromise
+			:andThen(function(winner)
+				self._logger:Info("Race group completed", { StepId = step.id, WinnerBranch = winner.branchIndex })
+				self.StepCompleted:Fire(step.id, winner, self._context)
+				return winner
+			end)
+			:catch(function(err)
+				self.StepFailed:Fire(step.id, err)
+				self._logger:Error("Race group failed", { StepId = step.id, Error = err })
+				return Promise.reject(err)
+			end)
+	end
+	
+	if step.isJoinStep then
+		self._logger:Info("Executing join step", { StepId = step.id })
+
+		local promise = Promise.resolve(nil)
+		
+		if step.action then
+			local actionResult = step.action(self._context)
+			if actionResult and type(actionResult) == "table" and actionResult.andThen then
+				promise = actionResult :: any
+			else
+				promise = Promise.resolve(actionResult)
+			end
+		end
+		
+		return promise
+			:andThen(function(result)
+				self._logger:Info("Join step completed", { StepId = step.id })
+				self.StepCompleted:Fire(step.id, result, self._context)
+				
+				if step.rollback then
+					table.insert(self._rollbacks, function()
+						self._logger:Info("Running rollback for join step", { StepId = step.id })
+						local success, err = pcall(function() 
+							if step.rollback then step.rollback(self._context) end 
+						end)
+						if not success then
+							self._logger:Warn("Rollback error", { StepId = step.id, Error = err })
+						end
+					end)
+				end
+				return result
+			end)
+			:catch(function(err)
+				self.StepFailed:Fire(step.id, err)
+				self._logger:Error("Join step failed", { StepId = step.id, Error = err })
+				return Promise.reject(err)
+			end)
 	end
 
 	local function tryAction(attempt)
@@ -422,6 +714,8 @@ function WorkflowOrchestratorService:Reset()
 	self._paused = false
 	self._isRunning = false
 	self._rollbacks = {}
+	self._activeBranches = {}
+	self._joinStepWaiting = false
 	self._logger:Info("Workflow reset")
 end
 
