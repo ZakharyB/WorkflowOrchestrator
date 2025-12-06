@@ -12,7 +12,7 @@ local orchestrator = WorkflowOrchestratorService.new()
 
 When you create a new instance of `WorkflowOrchestratorService` with the `new()`, it will allow the service to initialize
 
-```
+```lua
 local orchestrator = WorkflowOrchestratorService.new()
 orchestrator.WorkflowStarted:Connect(function()
 	print("Workflow execution has started!")
@@ -39,7 +39,7 @@ The function validates and adds a `WorkflowStep` to the orchestrator. All the st
     - `isJoinStep`: Marks a synchronization point.
     
 #### Examples
-```
+```lua
 -- Regular step with a simple action
 orchestrator:AddStep({
 	id = "Init",
@@ -47,7 +47,8 @@ orchestrator:AddStep({
 		print("Initializing context...")
 	end
 })
-
+```
+```lua
 -- Parallel groups: run multiple groups of steps at once
 orchestrator:AddStep({
 	id = "ParallelProcess",
@@ -56,7 +57,8 @@ orchestrator:AddStep({
 		{ { id = "TaskB", action = function() print("B") end } },
 	}
 })
-
+```
+```lua
 -- Race groups: only the first group to complete continues
 orchestrator:AddStep({
 	id = "RaceStep",
@@ -65,7 +67,9 @@ orchestrator:AddStep({
 		{ { id = "Slow", action = function() print("Slow branch") end } },
 	}
 })
+```
 
+```lua
 -- Branching logic: conditionally select which steps to run
 orchestrator:AddStep({
 	id = "ConditionalBranch",
@@ -74,7 +78,8 @@ orchestrator:AddStep({
 		ifFalse = { { id = "IsFalse", action = function() print("False branch") end } },
 	}
 })
-
+```
+```lua
 -- Loop condition: repeat step while condition holds
 orchestrator:AddStep({
 	id = "LoopExample",
@@ -84,7 +89,8 @@ orchestrator:AddStep({
 	end,
 	action = function() print("Loop iteration") end
 })
-
+```
+```lua
 -- ForEach loop: run step for each item in a list
 orchestrator:AddStep({
 	id = "ForEachExample",
@@ -93,7 +99,8 @@ orchestrator:AddStep({
 		print("Processing:", item)
 	end
 })
-
+```
+```lua
 -- Join step: waits for previous parallel/race branches to complete
 orchestrator:AddStep({
 	id = "JoinPoint",
