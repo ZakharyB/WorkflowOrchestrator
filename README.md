@@ -60,6 +60,7 @@ orchestrator:AddStep({
 ```
 ```lua
 -- Race groups: only the first group to complete continues
+-- you could use that to handle the first player to finish an objective
 orchestrator:AddStep({
 	id = "RaceStep",
 	raceGroups = {
@@ -92,6 +93,7 @@ orchestrator:AddStep({
 ```
 ```lua
 -- ForEach loop: run step for each item in a list
+-- you could use that to handle a player list for example
 orchestrator:AddStep({
 	id = "ForEachExample",
 	forEachArray = { "A", "B", "C" },
@@ -106,6 +108,19 @@ orchestrator:AddStep({
 	id = "JoinPoint",
 	isJoinStep = true
 })
+```
+
+---
+
+### WorkflowOrchestratorService:_rebuildStepIndex()
+
+This is used to rebuild the internal index map of the step IDs to their positions in the workflow.
+It allows fast access to steps by their IDs, it iterates all the registered steps in `_steps`, and updates the `_stepIdToIndex` table to keep synchronization when the steps are added, removed, or changed order.
+
+#### Example
+```lua
+-- After adding steps:
+orchestrator:_rebuildStepIndex()
 ```
 
 MORE DOCUMENTATION SOON
