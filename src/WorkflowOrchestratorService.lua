@@ -984,8 +984,23 @@ function WorkflowOrchestratorService:Run(context, workflowId: string?)
 	self.WorkflowStarted:Fire(self._context)
 
 	return Promise.new(function(resolve, reject)
-		self._mainResolve = resolve
-		self._mainReject = reject
+		self._mainResolve = function(...)
+			if self._workflowTimeoutPromise then
+				self._workflowTimeoutPromise:cancel()
+				self._workflowTimeoutPromise = nil
+			end
+
+			resolve(...)
+		end
+
+		self._mainReject = function(...)
+			if self._workflowTimeoutPromise then
+				self._workflowTimeoutPromise:cancel()
+				self._workflowTimeoutPromise = nil
+			end
+
+			reject(...)
+		end
 
 		self:_processQueue()
 	end)
