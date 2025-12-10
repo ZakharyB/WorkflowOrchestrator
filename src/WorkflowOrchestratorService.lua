@@ -959,7 +959,9 @@ function WorkflowOrchestratorService:_processQueue()
 end
 
 function WorkflowOrchestratorService:Run(context, workflowId: string?)
-	assert(not self._isRunning, "Workflow already running")
+	if self._isRunning then
+		return Promise.reject("Workflow already running")
+	end
 
 	self._isRunning = true
 	self._paused = false
@@ -1030,6 +1032,7 @@ function WorkflowOrchestratorService:Pause()
 	if not self._isRunning then
 		return false
 	end
+
 	if self._paused then
 		return false
 	end
